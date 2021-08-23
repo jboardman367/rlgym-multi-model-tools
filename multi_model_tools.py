@@ -7,13 +7,19 @@ import numpy as np
 import torch as th
 from stable_baselines3 import PPO
 from stable_baselines3.common import utils
+from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
-def multi_collect_rollouts(env: VecEnv, models: List[PPO],  n_rollout_steps: int, obs_size: int, all_callbacks: List[BaseCallback]):
+# This function is heavily based off the collect_rollouts() method of the sb3 OnPolicyAlgorithm
+def multi_collect_rollouts(
+        env: VecEnv, models: List[PPO], model_map: list, all_last_obs: list,  n_rollout_steps: int,
+        obs_size: int, all_callbacks: List[BaseCallback]):
+
     n_steps = 0
+    all_last_episode_restarts = [models[model_map[num]]._last_episode_starts for num in range(len(model_map))]
     for model in models:
         model.rollout_buffer.reset()
 
@@ -24,15 +30,20 @@ def multi_collect_rollouts(env: VecEnv, models: List[PPO],  n_rollout_steps: int
         all_values = []
         all_log_probs = []
         all_clipped_actions = []
-        for i in range(6):
-            with th.no_grad():
-                obs_tensor = obs_as_tensor(models[i]._last_obs, models[i].device)
-                actions, values, log_probs = models[i].policy.forward(obs_tensor)
+        for obs_index in range(len(model_map)):
+            with th.no_grad(): # probably need some list fuckery here
+                obs_tensor = obs_as_tensor(all_last_obs[obs_index], models[model_map[obs_index]].device)
+                actions, values, log_probs = models[model_map[obs_index]].policy.forward(obs_tensor)
             actions = actions.cpu().numpy()
             actions = actions[0] # it is inside an extra layer for some reason, so take it out
             clipped_actions = actions
-            if isinstance(models[i], gym.spaces.Box):
-                clipped_actions = np.clip(actions, models[i].action_space.low, models[i].action_space.high)
+            if isinstance(models[model_map[obs_index]], gym.spaces.Box):
+                clipped_actions = np.clip(
+                    actions,
+                    models[model_map[obs_index]].action_space.low,
+                    models[model_map[obs_index]].action_space.high
+                )
+
             all_clipped_actions.append(clipped_actions)
             all_actions.append(actions)
             all_values.append(values)
@@ -40,49 +51,65 @@ def multi_collect_rollouts(env: VecEnv, models: List[PPO],  n_rollout_steps: int
         flat_clipped_actions = np.asarray(all_clipped_actions)
         flat_new_obs, flat_rewards, flat_dones, flat_infos = env.step(flat_clipped_actions)
         infos_length = len(flat_infos) // 6
-        all_infos = [flat_infos[x*infos_length:(x+1)*infos_length] for x in range(6)]
-        all_rewards = [flat_rewards[x] for x in range(6)]
+        all_infos = [flat_infos[x*infos_length:(x+1)*infos_length] for x in range(len(model_map))]
+        all_rewards = [flat_rewards[x] for x in range(len(model_map))]
 
-        for model in models:
-            model.num_timesteps += 1
+        for obs_index in range(len(model_map)):
+            models[model_map[obs_index]].num_timesteps += 1
 
         for callback in all_callbacks: callback.update_locals(locals())
         if all(callback.on_step() is False for callback in all_callbacks):
             return False
 
-        for i in range(6):
-            models[i]._update_info_buffer(all_infos[i])
+        for model_index in range(len(models)):
+            models[model_index]._update_info_buffer(
+                [all_infos[num][0] for num in range(len(model_map)) if model_map[num] == model_index]
+            ) # this should put the needed infos for each model in
         n_steps += 1
 
-        for i in range(6):
-            if isinstance(models[i].action_space, gym.spaces.Discrete):
-                all_actions[i] = all_actions[i].reshape(-1,1)
+        for obs_index in range(len(model_map)):
+            if isinstance(models[model_map[obs_index]].action_space, gym.spaces.Discrete):
+                all_actions[obs_index] = all_actions[obs_index].reshape(-1,1)
 
-            models[i].rollout_buffer.add(
-                models[i]._last_obs[0], all_actions[i], all_rewards[i],
-                models[i]._last_episode_starts, all_values[i], all_log_probs[i]
+        for model_index in range(len(models)):
+
+            models[model_index].rollout_buffer.add( # disgusting list comprehension to send all the info to the buffer
+                np.asarray([all_last_obs[num][0] for num in range(len(model_map)) if model_map[num] == model_index]),
+                np.asarray([all_actions[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+                np.asarray([all_rewards[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+                np.asarray([all_last_episode_restarts[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+                th.tensor([all_values[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+                th.tensor([all_log_probs[num] for num in range(len(model_map)) if model_map[num] == model_index])
             )
-            models[i]._last_obs = flat_new_obs[i*obs_size:(i+1)*obs_size]
-            models[i]._last_episode_starts = flat_dones[i]
 
-    for i in range(6):
+        all_last_obs = [flat_new_obs[obs_index*(len(flat_new_obs)//6):(obs_index+1)*(len(flat_new_obs)//6)] for obs_index in range(len(flat_new_obs))]
+        all_last_episode_restarts = flat_dones
+
+    all_last_values, all_last_dones = [], []
+    for obs_index in range(len(model_map)):
         with th.no_grad():
             # compute value for the last timestamp
             # the og code uses new_obs where I have last_obs, so I hope this still works since they should hold the same value
-            obs_tensor = obs_as_tensor(models[i]._last_obs, models[i].device)
-            _, values, _ = models[i].policy.forward(obs_tensor)
+            obs_tensor = obs_as_tensor(all_last_obs[obs_index], models[model_map[obs_index]].device)
+            _, values, _ = models[model_map[obs_index]].policy.forward(obs_tensor)
+            all_last_values.append(values)
 
-        # this line also has a similar thing with dones instead of last_episode_starts in the og
-        models[i].rollout_buffer.compute_returns_and_advantage(last_values=values, dones=models[i]._last_episode_starts)
+    for model_index in range(len(models)):
+        models[model_index].rollout_buffer.compute_returns_and_advantage(
+            last_values=th.tensor([all_last_values[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+            dones=np.asarray([all_last_episode_restarts[num] for num in range(len(model_map)) if model_map[num] == model_index])
+        )
 
     for callback in all_callbacks: callback.on_rollout_end()
     return True
 
+# This function is heavily based off the learn() method of the sb3 OnPolicyAlgorithm
 def multi_learn(
         models: List[PPO],
         total_timesteps: int,
-        obs_size: int,
         env,
+        num_players: int,
+        model_map: Optional[list] = None,
         callbacks: List[MaybeCallback] = None,
         log_interval: int = 1,
         eval_env: Optional[GymEnv] = None,
@@ -92,53 +119,62 @@ def multi_learn(
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
 ):
-    iteration = 0
-    # this for loop is essentially the setup method
-    all_total_timesteps = []
-    for i in range(6):
-        models[i].start_time = time.time()
-        if models[i].ep_info_buffer is None or reset_num_timesteps:
-            models[i].ep_info_buffer = deque(maxlen=100)
-            models[i].ep_success_buffer = deque(maxlen=100)
+    # make sure everything lines up
+    assert len(models) == len(callbacks)
 
-        if models[i].action_noise is not None:
-            models[i].action_noise.reset()
+    iteration = 0
+    # this for loop is essentially the setup method, done for each model
+    model_map = model_map or [n % len(models) for n in range(num_players)]
+    obs_size = len(env.reset()) // len(model_map)  # calculate the length of the each observation
+    all_total_timesteps = []
+    for model_index in range(len(models)):
+        models[model_index].start_time = time.time()
+        if models[model_index].ep_info_buffer is None or reset_num_timesteps:
+            models[model_index].ep_info_buffer = deque(maxlen=100)
+            models[model_index].ep_success_buffer = deque(maxlen=100)
+
+        if models[model_index].action_noise is not None:
+            models[model_index].action_noise.reset()
 
         if reset_num_timesteps:
-            models[i].num_timesteps = 0
-            models[i]._episode_num = 0
+            models[model_index].num_timesteps = 0
+            models[model_index]._episode_num = 0
         else:
             # make sure training timestamps are ahead of internal counter
-            total_timesteps += models[i].num_timesteps
-        models[i]._total_timesteps = total_timesteps
+            total_timesteps += models[model_index].num_timesteps
+        models[model_index]._total_timesteps = total_timesteps
 
         # leaving out the environment reset, since that will be done for all at once
 
-        if eval_env is not None and models[i].seed is not None:
-            eval_env.seed(models[i].seed)
+        if eval_env is not None and models[model_index].seed is not None:
+            eval_env.seed(models[model_index].seed)
 
-        eval_env = models[i]._get_eval_env(eval_env)
+        eval_env = models[model_index]._get_eval_env(eval_env)
 
         # Configure logger's outputs if no logger was passed
-        if not models[i]._custom_logger:
-            models[i]._logger = utils.configure_logger(models[i].verbose, models[i].tensorboard_log, tb_log_name, reset_num_timesteps)
+        if not models[model_index]._custom_logger:
+            models[model_index]._logger = utils.configure_logger(
+                models[model_index].verbose, models[model_index].tensorboard_log, tb_log_name, reset_num_timesteps)
 
-        callbacks[i] = models[i]._init_callback(callbacks[i], eval_env, eval_freq, n_eval_episodes, log_path=None)
+        callbacks[model_index] = models[model_index]._init_callback(
+            callbacks[model_index], eval_env, eval_freq, n_eval_episodes, log_path=None)
 
         # instead of returning, I'm just going to shove these in lists
         all_total_timesteps.append(total_timesteps)
 
     for callback in callbacks: callback.on_training_start(locals(), globals())
     flat_last_obs = env.reset()
-    all_last_obs = [flat_last_obs[x*obs_size:(x+1)*obs_size] for x in range(6)]
-    for i in range(6):
-        models[i]._last_obs = all_last_obs[i]
-        models[i]._last_episode_starts = np.ones(1, dtype=bool)
+    all_last_obs = [flat_last_obs[x*obs_size:(x+1)*obs_size] for x in range(num_players)]
+
+    # make sure the n_envs is correct for the models
+    for model_index in range(len(models)):
+        models[model_index].n_envs = model_map.count(model_index)
+        models[model_index].rollout_buffer.n_envs = model_map.count(model_index)
 
     # I assume the correct thing here is to check each model separately for the while condition
-    while all([models[i].num_timesteps < all_total_timesteps[i] for i in range(6)]):
+    while all([models[i].num_timesteps < all_total_timesteps[i] for i in range(len(models))]):
         continue_training = multi_collect_rollouts(
-            env, models, min(model.n_steps for model in models), obs_size, callbacks
+            env, models, model_map, all_last_obs, min(model.n_steps for model in models), obs_size, callbacks
         )
 
         if continue_training is False:
@@ -149,17 +185,17 @@ def multi_learn(
             model._update_current_progress_remaining(model.num_timesteps, total_timesteps)
 
         # this is where the training info would be displayed
-        for model in models:
+        for model_index in range(len(models)):
             if log_interval is not None and iteration % log_interval == 0 :
-                fps = int(model.num_timesteps / (time.time() - model.start_time))
-                model.logger.record("time/iterations", iteration, exclude="tensorboard")
-                if len(model.ep_info_buffer) > 0 and len(model.ep_info_buffer[0]) > 0:
-                    model.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in model.ep_info_buffer]))
-                    model.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in model.ep_info_buffer]))
-                model.logger.record("time/fps", fps)
-                model.logger.record("time/time_elapsed", int(time.time() - model.start_time), exclude="tensorboard")
-                model.logger.record("time/total_timesteps", model.num_timesteps, exclude="tensorboard")
-                model.logger.dump(step=model.num_timesteps)
+                fps = int(models[model_index].num_timesteps / (time.time() - models[model_index].start_time))
+                models[model_index].logger.record("time/iterations", iteration * model_map.count(model_index), exclude="tensorboard")
+                if len(models[model_index].ep_info_buffer) > 0 and len(models[model_index].ep_info_buffer[0]) > 0:
+                    models[model_index].logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in models[model_index].ep_info_buffer]))
+                    models[model_index].logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in models[model_index].ep_info_buffer]))
+                models[model_index].logger.record("time/fps", fps)
+                models[model_index].logger.record("time/time_elapsed", int(time.time() - models[model_index].start_time), exclude="tensorboard")
+                models[model_index].logger.record("time/total_timesteps", models[model_index].num_timesteps, exclude="tensorboard")
+                models[model_index].logger.dump(step=models[model_index].num_timesteps)
 
         for model in models: model.train()
 
