@@ -48,7 +48,7 @@ if __name__ == '__main__':  # Required for multiprocessing
 
     # Hyperparameters presumably better than default; inspired by original PPO paper
     models = []
-    for _ in range(6):
+    for _ in range(4):
         model = PPO(
             'MlpPolicy',
             env,
@@ -69,21 +69,20 @@ if __name__ == '__main__':  # Required for multiprocessing
     # Save model every so often
     # Divide by num_envs (number of agents) because callback only increments every time all agents have taken a step
     # This saves to specified folder with a specified name
-    callbacks = [CheckpointCallback(round(1_000_000 / env.num_envs), save_path="policy", name_prefix=f"multi_{n}") for n in range(6)]
+    callbacks = [CheckpointCallback(round(1_000_000 / env.num_envs), save_path="policy", name_prefix=f"multi_{n}") for n in range(4)]
 
     # model.learn(100_000_000, callback=callback)
-    last_obs = env.reset()
-    model_map = list(range(6))
-    obs_size = len(last_obs) // len(model_map)
+
 
     multi_learn(
-        models= models,
-        total_timesteps= 10_000_000_000,
-        obs_size= obs_size,
+        models= models, # the list of models that will be used
+        total_timesteps= 10_000_000_000, # total timestamps that will be trained for
         env= env,
-        callbacks= callbacks
+        callbacks= callbacks, # list of callbacks, one for each model in the list of models
+        num_players= 6, # team_size * num_instances
+        model_map= [0, 0, 1, 2, 3, 3] # mapping of models to players. If this is also known to the reward function,
+        #                             # one could allow each model to use a different reward
     )
-
 
     # Now, if one wants to load a trained model from a checkpoint, use this function
     # This will contain all the attributes of the original model
