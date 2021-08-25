@@ -142,7 +142,7 @@ def multi_learn(
         eval_env: Optional[GymEnv] = None,
         eval_freq: int = -1,
         n_eval_episodes: int = 5,
-        tb_log_name: str = "OnPolicyAlgorithm",
+        tb_log_name: str = "MultiPPO",
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
 ):
@@ -186,7 +186,10 @@ def multi_learn(
         # Configure logger's outputs if no logger was passed
         if not models[model_index]._custom_logger:
             models[model_index]._logger = utils.configure_logger(
-                models[model_index].verbose, models[model_index].tensorboard_log, tb_log_name, reset_num_timesteps)
+                models[model_index].verbose,
+                models[model_index].tensorboard_log,
+                tb_log_name + f'_model{model_index}',
+                reset_num_timesteps)
 
         callbacks[model_index] = models[model_index]._init_callback(
             callbacks[model_index], eval_env, eval_freq, n_eval_episodes, log_path=None)
