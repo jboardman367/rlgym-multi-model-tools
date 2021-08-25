@@ -1,7 +1,7 @@
 # rlgym-multi-model-tools
 Tools for rlgym-tools for training multiple models at once, and training against other models
 
-The example is basically just the example from rlgym-tools
+Can handle pretty much any arrangement of models into the match, and can mask certain models
+out of the learning.
 
-## NOTE:
-This runs so, so, slowly. Any help with speeding it up is appreciated
+The example is basically just the example from rlgym-tools
