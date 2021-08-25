@@ -13,6 +13,15 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 from time import perf_counter
+from typing import Dict, Optional, Union
+
+# This is to allow sequential multi_learn calls
+globs = {
+"LAST_ALL_OBS" : None,
+"LAST_MODEL_MAP" : None,
+"OBS_SIZE" : None
+} # type: Dict[str, Optional[Union[int, list]]]
+
 
 # This function is heavily based off the collect_rollouts() method of the sb3 OnPolicyAlgorithm
 def multi_collect_rollouts(
@@ -76,7 +85,7 @@ def multi_collect_rollouts(
 
         for callback in all_callbacks: callback.update_locals(locals())
         if any(callback.on_step() is False for callback in all_callbacks):
-            return False
+            return False, all_last_obs
 
         for model_index in range(models_length):
             models[model_index]._update_info_buffer(
@@ -118,7 +127,7 @@ def multi_collect_rollouts(
         )
 
     for callback in all_callbacks: callback.on_rollout_end()
-    return True
+    return True, all_last_obs
 
 # This function is heavily based off the learn() method of the sb3 OnPolicyAlgorithm
 def multi_learn(
@@ -137,7 +146,6 @@ def multi_learn(
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
 ):
-
     model_map = model_map or [n % len(models) for n in range(num_players)]
     learning_mask = learning_mask or [True for _ in range(len(models))]
 
@@ -146,7 +154,8 @@ def multi_learn(
 
     iteration = 0
     # this for loop is essentially the setup method, done for each model
-    obs_size = len(env.reset()) // len(model_map)  # calculate the length of the each observation
+    if globs['OBS_SIZE'] is None:
+        globs['OBS_SIZE'] = len(env.reset()) // len(model_map)  # calculate the length of the each observation
     all_total_timesteps = []
     for model_index in range(len(models)):
         models[model_index].start_time = time.time()
@@ -160,10 +169,12 @@ def multi_learn(
         if reset_num_timesteps:
             models[model_index].num_timesteps = 0
             models[model_index]._episode_num = 0
+            all_total_timesteps.append(total_timesteps)
+            models[model_index]._total_timesteps = total_timesteps
         else:
             # make sure training timestamps are ahead of internal counter
-            total_timesteps += models[model_index].num_timesteps
-        models[model_index]._total_timesteps = total_timesteps
+            all_total_timesteps.append(total_timesteps + models[model_index].num_timesteps)
+            models[model_index]._total_timesteps = total_timesteps + models[model_index].num_timesteps
 
         # leaving out the environment reset, since that will be done for all at once
 
@@ -180,12 +191,12 @@ def multi_learn(
         callbacks[model_index] = models[model_index]._init_callback(
             callbacks[model_index], eval_env, eval_freq, n_eval_episodes, log_path=None)
 
-        # instead of returning, I'm just going to shove these in lists
-        all_total_timesteps.append(total_timesteps)
 
     for callback in callbacks: callback.on_training_start(locals(), globals())
-    flat_last_obs = env.reset()
-    all_last_obs = [flat_last_obs[x*obs_size:(x+1)*obs_size] for x in range(num_players)]
+    if globs["LAST_ALL_OBS"] is None:
+        flat_last_obs = env.reset()
+        globs["LAST_ALL_OBS"] = [flat_last_obs[x*globs['OBS_SIZE']:(x+1)*globs['OBS_SIZE']] for x in range(num_players)]
+
 
     # make sure the n_envs is correct for the models
     for model_index in range(len(models)):
@@ -194,8 +205,8 @@ def multi_learn(
 
     # I assume the correct thing here is to check each model separately for the while condition
     while all([models[i].num_timesteps < all_total_timesteps[i] for i in range(len(models))]):
-        continue_training = multi_collect_rollouts(
-            env, models, model_map, all_last_obs, min(model.n_steps for model in models), obs_size, callbacks, learning_mask
+        continue_training, globs["LAST_ALL_OBS"] = multi_collect_rollouts(
+            env, models, model_map, globs["LAST_ALL_OBS"], min(model.n_steps for model in models), globs["OBS_SIZE"], callbacks, learning_mask
         )
 
         if continue_training is False:
@@ -223,5 +234,6 @@ def multi_learn(
 
 
     for callback in callbacks: callback.on_training_end()
+
 
     return models
