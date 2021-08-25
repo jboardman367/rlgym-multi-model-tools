@@ -97,7 +97,7 @@ def multi_collect_rollouts(
             if isinstance(models[model_map[obs_index]].action_space, gym.spaces.Discrete):
                 all_actions[obs_index] = all_actions[obs_index].reshape(-1,1)
         for model_index in range(models_length):
-            if learning_mask[model_index]: # skip learing where not necessary
+            if learning_mask[model_index] and model_index in model_map: # skip learing where not necessary
                 models[model_index].rollout_buffer.add( # disgusting list comprehension to send all the info to the buffer
                     np.asarray([all_last_obs[num][0] for num in range(len(model_map)) if model_map[num] == model_index]),
                     np.asarray([all_actions[num] for num in range(len(model_map)) if model_map[num] == model_index]),
@@ -121,10 +121,11 @@ def multi_collect_rollouts(
             all_last_values.append(values)
 
     for model_index in range(len(models)):
-        models[model_index].rollout_buffer.compute_returns_and_advantage(
-            last_values=th.tensor([all_last_values[num] for num in range(len(model_map)) if model_map[num] == model_index]),
-            dones=np.asarray([all_last_episode_restarts[num] for num in range(len(model_map)) if model_map[num] == model_index])
-        )
+        if model_index in model_map:
+            models[model_index].rollout_buffer.compute_returns_and_advantage(
+                last_values=th.tensor([all_last_values[num] for num in range(len(model_map)) if model_map[num] == model_index]),
+                dones=np.asarray([all_last_episode_restarts[num] for num in range(len(model_map)) if model_map[num] == model_index])
+            )
 
     for callback in all_callbacks: callback.on_rollout_end()
     return True, all_last_obs
@@ -216,12 +217,13 @@ def multi_learn(
             break
 
         iteration += 1
-        for model in models:
-            model._update_current_progress_remaining(model.num_timesteps, total_timesteps)
+        for model_index in range(len(models)):
+            if model_index in model_map:
+                models[model_index]._update_current_progress_remaining(models[model_index].num_timesteps, total_timesteps)
 
         # this is where the training info would be displayed
         for model_index in range(len(models)):
-            if log_interval is not None and iteration % log_interval == 0 and learning_mask[model_index]:
+            if log_interval is not None and iteration % log_interval == 0 and learning_mask[model_index] and model_index in model_map:
                 fps = int(models[model_index].num_timesteps / (time.time() - models[model_index].start_time))
                 models[model_index].logger.record("time/iterations", iteration * model_map.count(model_index), exclude="tensorboard")
                 if len(models[model_index].ep_info_buffer) > 0 and len(models[model_index].ep_info_buffer[0]) > 0:
@@ -233,7 +235,7 @@ def multi_learn(
                 models[model_index].logger.dump(step=models[model_index].num_timesteps)
 
         for model_index in range(len(models)):
-            if learning_mask[model_index]: models[model_index].train()
+            if learning_mask[model_index] and model_index in model_map: models[model_index].train()
 
 
     for callback in callbacks: callback.on_training_end()
