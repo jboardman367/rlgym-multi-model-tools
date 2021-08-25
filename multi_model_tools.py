@@ -18,7 +18,6 @@ from time import perf_counter
 def multi_collect_rollouts(
         env: VecEnv, models: List[PPO], model_map: list, all_last_obs: list,  n_rollout_steps: int,
         obs_size: int, all_callbacks: List[BaseCallback], learning_mask: List[bool]):
-    p = perf_counter()
     n_steps = 0
     all_last_episode_restarts = [models[model_map[num]]._last_episode_starts for num in range(len(model_map))]
     for model in models:
@@ -28,40 +27,49 @@ def multi_collect_rollouts(
 
     models_length = len(models)
     map_length = len(model_map)
-    print('setup: ', perf_counter() - p)
-    p = perf_counter()
     while n_steps < n_rollout_steps:
-        all_actions = []
-        all_values = []
-        all_log_probs = []
-        all_clipped_actions = []
-        pp = perf_counter()
-        for obs_index in range(map_length):
-            with th.no_grad():
-                obs_tensor = obs_as_tensor(all_last_obs[obs_index], models[model_map[obs_index]].device)
-                actions, values, log_probs = models[model_map[obs_index]].policy.forward(obs_tensor)
-            actions = actions.cpu().numpy()
-            clipped_actions = actions[0] # it is inside an extra layer for some reason, so take it out
-            if isinstance(models[model_map[obs_index]], gym.spaces.Box):
-                clipped_actions = np.clip(
-                    actions,
-                    models[model_map[obs_index]].action_space.low,
-                    models[model_map[obs_index]].action_space.high
-                )
+        # create indexes to replace later
+        all_actions = [0 for _ in range(map_length)]
+        all_values = [0 for _ in range(map_length)]
+        all_log_probs = [0 for _ in range(map_length)]
+        all_clipped_actions = [0 for _ in range(map_length)]
 
-            all_clipped_actions.append(clipped_actions)
-            all_actions.append(actions)
-            all_values.append(values)
-            all_log_probs.append(log_probs)
-        print('getting model predictions: ', perf_counter() - pp)
-        pp = perf_counter()
+        # disgusting dict and list comprehension to put the same model obs together
+        per_model_obs = { model_index:
+            np.array([
+                all_last_obs[obs_index] for obs_index in range(map_length) if model_map[obs_index] == model_index
+            ])
+            for model_index in range(models_length) if model_index in model_map
+        }
+
+        for model_index in range(models_length):
+            if model_index in model_map:
+                with th.no_grad():
+                    obs_tensor = obs_as_tensor(per_model_obs[model_index], models[model_index].device)
+                    actions, values, log_probs = models[model_index].policy.forward(obs_tensor)
+                actions = actions.cpu().numpy()
+                clipped_actions = actions #[0] # it is inside an extra layer for some reason, so take it out
+                if isinstance(models[model_index], gym.spaces.Box):
+                    clipped_actions = np.clip(
+                        actions,
+                        models[model_index].action_space.low,
+                        models[model_index].action_space.high
+                    )
+
+                next_index_start = 0
+                # put everything back in terms of the model map
+                for i in range(model_map.count(model_index)):
+                    next_index = model_map.index(model_index, next_index_start)
+                    next_index_start = next_index + 1
+                    all_clipped_actions[next_index] = clipped_actions[i]
+                    all_actions[next_index] = actions[i]
+                    all_values[next_index] = values[i]
+                    all_log_probs[next_index] = log_probs[i]
         flat_clipped_actions = np.array(all_clipped_actions)
         flat_new_obs, flat_rewards, flat_dones, flat_infos = env.step(flat_clipped_actions)
         infos_length = len(flat_infos) // 6
         all_infos = [flat_infos[x*infos_length:(x+1)*infos_length] for x in range(map_length)]
         all_rewards = [flat_rewards[x] for x in range(map_length)]
-        print('getting env stuff: ', perf_counter() - pp)
-        pp = perf_counter()
 
         for obs_index in range(map_length):
             models[model_map[obs_index]].num_timesteps += 1
@@ -70,29 +78,25 @@ def multi_collect_rollouts(
         if any(callback.on_step() is False for callback in all_callbacks):
             return False
 
-        pp = perf_counter()
         for model_index in range(models_length):
             models[model_index]._update_info_buffer(
                 [all_infos[num][0] for num in range(map_length) if model_map[num] == model_index]
             ) # this should put the needed infos for each model in
         n_steps += 1
-        print('putting shit into the info buffer: ', perf_counter() - pp)
 
         for obs_index in range(map_length):
             if isinstance(models[model_map[obs_index]].action_space, gym.spaces.Discrete):
                 all_actions[obs_index] = all_actions[obs_index].reshape(-1,1)
-        pp = perf_counter()
         for model_index in range(models_length):
             if learning_mask[model_index]: # skip learing where not necessary
                 models[model_index].rollout_buffer.add( # disgusting list comprehension to send all the info to the buffer
                     np.asarray([all_last_obs[num][0] for num in range(len(model_map)) if model_map[num] == model_index]),
-                    np.asarray([all_actions[num][0] for num in range(len(model_map)) if model_map[num] == model_index]),
+                    np.asarray([all_actions[num] for num in range(len(model_map)) if model_map[num] == model_index]),
                     np.asarray([all_rewards[num] for num in range(len(model_map)) if model_map[num] == model_index]),
                     np.asarray([all_last_episode_restarts[num] for num in range(len(model_map)) if model_map[num] == model_index]),
                     th.tensor([all_values[num] for num in range(len(model_map)) if model_map[num] == model_index]),
                     th.tensor([all_log_probs[num] for num in range(len(model_map)) if model_map[num] == model_index])
                 )
-        print("putting shit in the rollout buffer: ", perf_counter() - pp)
 
         new_obs_len = len(flat_new_obs) // map_length
         all_last_obs = [flat_new_obs[obs_index * new_obs_len:(obs_index + 1) * new_obs_len] for obs_index in range(map_length)]
@@ -214,7 +218,8 @@ def multi_learn(
                 models[model_index].logger.record("time/total_timesteps", models[model_index].num_timesteps, exclude="tensorboard")
                 models[model_index].logger.dump(step=models[model_index].num_timesteps)
 
-        for model in models: model.train()
+        for model_index in range(len(models)):
+            if learning_mask[model_index]: models[model_index].train()
 
 
     for callback in callbacks: callback.on_training_end()
