@@ -26,8 +26,7 @@ if __name__ == '__main__':  # Required for multiprocessing
 
     fps = 120 / frame_skip
     gamma = np.exp(np.log(0.5) / (fps * half_life_seconds))  # Quick mafs
-    horizon = 2 * round(1 / (1 - gamma))  # Inspired by OpenAI Five
-    print(f"fps={fps}, gamma={gamma}, horizon={horizon}")
+    print(f"fps={fps}, gamma={gamma}")
 
     def get_match():  # Need to use a function so that each instance can call it and produce their own objects
         return Match(
@@ -56,15 +55,14 @@ if __name__ == '__main__':  # Required for multiprocessing
         model = PPO(
             'MlpPolicy',
             env,
-            n_epochs=10,                 # PPO calls for multiple epochs, SB3 does early stopping to maintain target kl
-            target_kl=0.02 / 1.5,        # KL to aim for (divided by 1.5 because it's multiplied later for unknown reasons)
-            learning_rate=3e-5,          # Around this is fairly common for PPO
+            n_epochs=32,                 # PPO calls for multiple epochs, SB3 does early stopping to maintain target kl
+            learning_rate=1e-5,          # Around this is fairly common for PPO
             ent_coef=0.01,               # From PPO Atari
             vf_coef=1.,                  # From PPO Atari
             gamma=gamma,                 # Gamma as calculated using half-life
             verbose=3,                   # Print out all the info as we're going
-            batch_size=horizon,          # Batch size as high as possible within reason
-            n_steps=horizon,             # Number of steps to perform before optimizing network
+            batch_size=4096,          # Batch size as high as possible within reason
+            n_steps=4096,             # Number of steps to perform before optimizing network
             tensorboard_log="out/logs",  # `tensorboard --logdir out/logs` in terminal to see graphs
             device="auto"                # Uses GPU if available
         )
