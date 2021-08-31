@@ -78,7 +78,7 @@ def multi_collect_rollouts(
                     all_log_probs[next_index] = log_probs[i]
         flat_clipped_actions = np.array(all_clipped_actions)
         flat_new_obs, flat_rewards, flat_dones, flat_infos = env.step(flat_clipped_actions)
-        infos_length = len(flat_infos) // 6
+        infos_length = len(flat_infos) // map_length
         all_infos = [flat_infos[x*infos_length:(x+1)*infos_length] for x in range(map_length)]
         all_rewards = [flat_rewards[x] for x in range(map_length)]
 
